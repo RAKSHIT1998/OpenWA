@@ -3,6 +3,8 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
+  HttpException,
+  HttpStatus,
   OnModuleDestroy,
   OnModuleInit,
   OnApplicationBootstrap,
@@ -20,6 +22,7 @@ import { Template } from '../template/entities/template.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
 import { CreateSessionDto } from './dto';
 import { EngineFactory } from '../../engine/engine.factory';
+import { resolveAuthTimeoutMs } from '../../engine/adapters/whatsapp-web-js.adapter';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { userPart } from '../../engine/identity/wa-id';
 import { paginate, ListOptions, resolveListWindow } from '../../common/utils/paginate';
@@ -96,6 +99,39 @@ export function resolveMaxConcurrentSessions(configService?: Pick<ConfigService,
   const configured = configService?.get<number>('sessions.maxConcurrent', 0) ?? 0;
   if (!Number.isFinite(configured) || configured <= 0) return null;
   return Math.floor(configured);
+}
+
+/**
+ * Distinguishes a wedged-initialization timeout from a real engine.initialize() rejection. Only the
+ * timeout case is handled inside initializeEngine(); real rejections must propagate untouched so the
+ * caller's catch (start() → FAILED+reason, executeReconnect() → retry) keeps the behavior #600/#631
+ * established. See initializeEngine().
+ */
+export class EngineInitTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`engine.initialize() timed out after ${timeoutMs}ms`);
+    this.name = 'EngineInitTimeoutError';
+  }
+}
+
+/**
+ * whatsapp-web.js throws this primitive STRING (not an Error) from its inject() auth poll when WA Web's
+ * login bootstrap doesn't complete within authTimeoutMs (default 30s). Match it defensively as both the
+ * bare string and an Error carrying the same message, since the library's throw shape isn't contracted.
+ */
+const ENGINE_AUTH_TIMEOUT = 'auth timeout';
+
+/**
+ * Diagnostic surfaced when the engine's internal auth-timeout fires (#733): points at the usual cause
+ * (the session proxy / network egress / firewall blocking WhatsApp so no QR is ever delivered) and the
+ * WWEBJS_AUTH_TIMEOUT_MS knob for legitimately slow first boots.
+ */
+const ENGINE_AUTH_TIMEOUT_MESSAGE =
+  'WhatsApp Web authentication timed out. Verify the session proxy URL and network egress can reach ' +
+  'WhatsApp; for slow first boots, raise WWEBJS_AUTH_TIMEOUT_MS.';
+
+function isAuthTimeoutRejection(err: unknown): boolean {
+  return err === ENGINE_AUTH_TIMEOUT || (err instanceof Error && err.message === ENGINE_AUTH_TIMEOUT);
 }
 
 @Injectable()
@@ -653,7 +689,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // initializes, so writing INITIALIZING afterwards would clobber that progress.
     await this.updateStatus(id, SessionStatus.INITIALIZING);
 
-    await engine.initialize({
+    const initPromise = engine.initialize({
       onQRCode: (qr: string): void => {
         if (!this.isLiveEngine(id, engine)) return;
         this.logger.log('QR code generated', {
@@ -1137,6 +1173,79 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         this.evictAndForceDestroy(id, engine);
       },
     });
+
+    // engine.initialize() launches Chromium and navigates to WhatsApp Web with no internal timeout:
+    // whatsapp-web.js calls page.goto(..., { timeout: 0 }) and its web-version-cache fetch has none
+    // either. If the browser stalls under container memory pressure (observed in prod: a session
+    // wedged in INITIALIZING with no error logged and GET /sessions/:id/qr 400ing forever), this
+    // await never settles. Race it against a deadline so a wedged init fails fast instead.
+    //
+    // ONLY the timeout case mutates state here. A REAL rejection (e.g. Chromium can't launch) must
+    // propagate untouched so start()'s catch keeps owning FAILED+reason (the diagnosability #600/#631
+    // added) — pre-deleting the engine and writing DISCONNECTED here would make start()'s
+    // `engines.get(id)` return undefined, skip its FAILED write, and hide the failure reason.
+    // The deadline MUST exceed the auth wait whatsapp-web.js runs INSIDE engine.initialize()
+    // (authTimeoutMs — the inject() poll for WA Web's JS to bootstrap, raisable via
+    // WWEBJS_AUTH_TIMEOUT_MS for slow first boots, e.g. WSL2/low-resource containers). A shorter
+    // outer deadline would SIGKILL a legitimate slow init mid-auth. Floor 60s for the hang case;
+    // otherwise give the configured auth window + 30s for launch/navigation/post-inject overhead.
+    const engineInitTimeoutMs = Math.max(60_000, (resolveAuthTimeoutMs() ?? 30_000) + 30_000);
+    // Promise.race can't cancel the losing promise, so swallow a late rejection from initPromise.
+    initPromise.catch(() => undefined);
+
+    let initTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        initPromise,
+        new Promise<never>((_, reject) => {
+          initTimer = setTimeout(() => reject(new EngineInitTimeoutError(engineInitTimeoutMs)), engineInitTimeoutMs);
+        }),
+      ]);
+    } catch (err) {
+      if (err instanceof EngineInitTimeoutError) {
+        this.logger.error(`Engine initialization timed out for session ${session.name}`, undefined, {
+          sessionId: id,
+          action: 'engine_init_timeout',
+        });
+        this.sessionErrors.set(id, err.message);
+        // Evict from the map BEFORE tearing down. forceDestroy() → beginClientTeardown → setStatus
+        // fires onStateChanged SYNCHRONOUSLY while the engine is still live, so isLiveEngine would
+        // pass and the callback would run a redundant DISCONNECTED write against this path; removing
+        // the engine first makes isLiveEngine return false. Unlike delete()/stop()/forceKill(), this
+        // path has no stoppingSessions + cancelReconnect wrap to fall back on. Matches the canonical
+        // delete-before-teardown at evictAndForceDestroy() and start()'s catch.
+        //
+        // Do NOT port this reorder to delete()/stop()/forceKill(): there, engines.has(id) staying
+        // TRUE for the duration of the teardown await is the sole deterministic block on a concurrent
+        // start() (start() clears stoppingSessions rather than rejecting on it), so delete-first would
+        // open a start()-during-teardown orphan-engine window. Verified in the teardown-ordering audit.
+        this.engines.delete(id);
+        // Force-kill whatever got launched so a retry doesn't collide with an orphaned browser.
+        // teardownEngineSafely is itself time-bound, so this can't wedge a second time.
+        await this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
+        await this.updateStatus(id, SessionStatus.DISCONNECTED);
+        // Map to a diagnostic 504 like the auth-timeout branch below, so a wedged init doesn't escape as a
+        // bare 500 (#733 follow-up). The browser stalled mid-startup — usually a container memory/resource
+        // limit or a wedged Chromium, not a network/proxy issue (that's the auth-timeout's signature).
+        throw new HttpException(
+          `Engine initialization timed out after ${err.timeoutMs}ms — the browser process did not complete ` +
+            'startup in time (often a container memory/resource limit or a stalled Chromium, not a network ' +
+            'issue). Retry the session; for chronically slow first boots, raise WWEBJS_AUTH_TIMEOUT_MS.',
+          HttpStatus.GATEWAY_TIMEOUT,
+        );
+      } else if (isAuthTimeoutRejection(err)) {
+        // The engine's INTERNAL auth-timeout: whatsapp-web.js throws the primitive string 'auth timeout'
+        // (see ENGINE_AUTH_TIMEOUT) when its inject poll exhausts authTimeoutMs (default 30s) — the common
+        // pre-QR failure when the browser launched but couldn't reach WhatsApp, e.g. a dead/unreachable
+        // session proxy (#733). onError already evicted the engine + wrote FAILED before this catch ran, so
+        // only the HTTP mapping remains: surface a diagnostic 504 instead of letting the bare string escape
+        // to NestJS's default handler as a meaningless 500.
+        throw new HttpException(ENGINE_AUTH_TIMEOUT_MESSAGE, HttpStatus.GATEWAY_TIMEOUT);
+      }
+      throw err;
+    } finally {
+      if (initTimer) clearTimeout(initTimer);
+    }
   }
 
   /**
